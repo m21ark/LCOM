@@ -1,39 +1,19 @@
-#include <lcom/lcf.h>
-
-#include <stdint.h>
-#include <handlers.h>
+#include "utils.h"
 
 int(util_get_LSB)(uint16_t val, uint8_t *lsb) {
-  
-  NullSafety(lsb);
-  *lsb = val;
-
-  return EXIT_SUCCESS;
+  *lsb = (uint8_t) (0X00ff & val);
+  return 0;
 }
 
 int(util_get_MSB)(uint16_t val, uint8_t *msb) {
-
-  NullSafety(msb);
-  *msb = val >> 8;
-
-  return EXIT_SUCCESS;
+  *msb = (uint8_t) (val >> 8);
+  return 0;
 }
 
-#ifdef LAB3
-    uint32_t inb_counter = 0;
-#endif
-
-int (util_sys_inb)(int port, uint8_t *value) {
-  NullSafety(value);
-  
-  uint32_t p;
-  
-  #ifdef LAB3
-        ++inb_counter;
-  #endif
-  CHECKCall(sys_inb(port, &p));
-  
-  *value = (uint8_t)p;
-
-  return EXIT_SUCCESS;
+int(util_sys_inb)(int port, uint8_t *value) {
+  uint32_t c;
+  if (sys_inb(port, &c))
+    return 1;
+  *value = (uint8_t) c;
+  return 0;
 }

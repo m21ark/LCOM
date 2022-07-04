@@ -1,41 +1,100 @@
-#include <lcom/lcf.h>
+#include "mouse.h"
 
-#include <mouse.h>
-#include <handlers.h>
-#include <i8042.h>
-#include <kbc.h>
+static int hook_id;
+uint8_t scancode;
 
-void (mouse_ih)(void) {
-  kbc_ih();
+int(mouse_subscribe_int)(uint8_t *bit_no) {
+  *bit_no = hook_id = MOUSE_IRQ;
+  sys_irqsetpolicy(MOUSE_IRQ, IRQ_REENABLE | IRQ_EXCLUSIVE, &hook_id);
+  return 0;
 }
 
-packet_t mouse_data_to_packet(uint8_t* data) {
-  struct packet pp;
-  pp.bytes[0] = data[0];
-  pp.bytes[1] = data[1];
-  pp.bytes[2] = data[2];
-  pp.rb = pp.bytes[0] & RB_MOUSE;
-  pp.mb = pp.bytes[0] & MB_MOUSE;
-  pp.lb = pp.bytes[0] & LB_MOUSE;
-  pp.delta_x  = (data[0] & MSB_X_DELTA)  ?  pp.bytes[1] - 256 : pp.bytes[1];
-  pp.delta_y  = (data[0] & MSB_Y_DELTA)  ?  pp.bytes[2] - 256 : pp.bytes[2];
-  pp.x_ov = pp.bytes[0] & X_OVERFLOW;
-  pp.y_ov = pp.bytes[0] & Y_OVERFLOW;
-  return pp;
+int(mouse_unsubscribe_int)() {
+  sys_irqrmpolicy(&hook_id);
+  return 0;
 }
 
-int mouse_disable_data_reporting() {
+void(mouse_ih)() {
+  while (1) {
 
-  return kbc_send_mouse_cmd(DIS_DATA_REP);
+    if (check_out_buf()) {
+      if (util_sys_inb(BUF_PORT, &scancode))
+        scancode = 0;
+      break;
+    }
+
+    scancode = 0;
+    tickdelay(micros_to_ticks(DELAY_US));
+  }
 }
 
-int _mouse_enable_data_reporting_() {
-  return kbc_send_mouse_cmd(ENA_DATA_REP);
+bool(check_in_buf)() {
+
+  uint8_t stat;
+  util_sys_inb(REG_PORT, &stat);
+
+  return !(stat & IBF);
 }
 
-struct mouse_ev* mouse_get_event(struct packet *pp) {
+bool(check_out_buf)() {
+
+  uint8_t stat;
+  util_sys_inb(REG_PORT, &stat);
+
+  if (stat & OBF)
+    return !(stat & (SR_PARITY_ERROR | SR_TO_ERROR));
+
+  return false;
+}
+
+int(mouse_write_cmd)(uint32_t cmd, uint8_t *resp) {
+
+  for (int i = 0; i < 3; i++)
+    if (check_in_buf()) {
+      sys_outb(KBC_WRITE_CMD, cmd);
+      util_sys_inb(BUF_PORT, resp);
+    }
+
+  return 1;
+}
+
+int(mouse_option)(uint8_t cmd) {
+  uint8_t resp, error2 = 0;
+
+  do {
+    sys_outb(REG_PORT, WRITE_B_MOUSE);
+    mouse_write_cmd(cmd, &resp);
+
+    if (resp == ACK)
+      return 0;
+    else if (resp == NACK)
+      error2++;
+    else if (resp == ERROR)
+      return 1;
+
+  } while (error2 < 2);
+
+  return 1;
+}
+
+void(makePack)(struct packet *pack) {
+
+  uint8_t b0 = pack->bytes[0];
+
+  pack->lb = b0 & LB;
+  pack->mb = b0 & MB;
+  pack->rb = b0 & RB;
+
+  pack->x_ov = b0 & X_OVFL;
+  pack->y_ov = b0 & Y_OVFL;
+
+  // complemento para 2
+  pack->delta_x = (b0 & MSB_X_DELTA) ? (pack->bytes[1] - 256) : pack->bytes[1];
+  pack->delta_y = (b0 & MSB_Y_DELTA) ? (pack->bytes[2] - 256) : pack->bytes[2];
+}
+
+struct mouse_ev *mouse_get_event(struct packet *pp) {
   static struct mouse_ev event;
-  NullSafety(pp);
 
   static bool lb_pressed = false, rb_pressed = false, mb_pressed = false;
 
@@ -55,12 +114,12 @@ struct mouse_ev* mouse_get_event(struct packet *pp) {
     event.type = RB_RELEASED;
     rb_pressed = false;
   }
-  else if ( !mb_pressed && pp->mb) {
-    mb_pressed  = true;
+  else if (!mb_pressed && pp->mb) {
+    mb_pressed = true;
     event.type = BUTTON_EV;
   }
   else if (mb_pressed && !pp->mb) {
-    mb_pressed  = false;
+    mb_pressed = false;
     event.type = BUTTON_EV;
   }
   else

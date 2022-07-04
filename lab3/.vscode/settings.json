@@ -7,9 +7,7 @@
   "editor.wordWrap": "bounded",
   "editor.wordWrapColumn": 100,
   "files.associations": {
-    "lcf.h": "c",
-    "keyboard.h": "c",
-    "handlers.h": "c",
-    "lab3.h": "c"
+    "i8042.h": "c",
+    "lcf.h": "c"
   },
 }

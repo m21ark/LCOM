@@ -1,174 +1,159 @@
-#include <lcom/lcf.h>
-
+#include "i8042.h"
+#include "i8254.h"
+#include "kbd.h"
 #include <lcom/lab3.h>
-
+#include <lcom/lcf.h>
 #include <stdbool.h>
 #include <stdint.h>
-
-#include <i8042.h>
-#include <i8254.h>
-#include <keyboard.h>
-#include <handlers.h>
-#include <kbc.h>
-
-extern uint32_t inb_counter;
-extern bool two_byte_scancode;
-extern uint32_t n_interrupts;
+#include <stdio.h>
 
 int main(int argc, char *argv[]) {
-  // sets the language of LCF messages (can be either EN-US or PT-PT)
   lcf_set_language("EN-US");
-
-  // enables to log function invocations that are being "wrapped" by LCF
-  // [comment this out if you don't want/need it]
-  lcf_trace_calls("/home/lcom/labs/lab3/trace.txt");
-
-  // enables to save the output of printf function calls on a file
-  // [comment this out if you don't want/need it]
-  lcf_log_output("/home/lcom/labs/lab3/output.txt");
-
-  // handles control over to LCF
-  // [LCF handles command line arguments and invokes the right function]
   if (lcf_start(argc, argv))
     return 1;
-
-  // LCF clean up tasks
-  // [must be the last statement before return]
   lcf_cleanup();
-
   return 0;
 }
 
+extern uint8_t scancode; // keyboard's scancode
+extern unsigned count_inb;
+
 int(kbd_test_scan)() {
-  uint8_t kbc_bit_no = 1;
-  int kbc_hook_id = 0, ipc_status;
-  bool esc_pressed = false, r;
-  uint16_t irq_set = BIT(kbc_bit_no);
 
+  int ipc_status;
   message msg;
-  
-  unsigned char scan[2];
-  int scan_size;
+  uint8_t bit_no;
 
-  CHECKCall(subscribe_kbc_interrupt(kbc_bit_no, &kbc_hook_id, KEYBOARD_IRQ));
+  // Substituir minix pelo nosso interrupt handler
+  kbd_subscribe_int(&bit_no);
 
-  while (!esc_pressed) { 
+  // vars para ler os bytes scancode
+  bool another_read = false;
+  uint8_t codes[2];
 
-    if ((r = driver_receive(ANY, &msg, &ipc_status)) != 0) {
-      printf("driver_receive failed with: %d", r);
+  while (scancode != ESC_BREAKCODE) {
+    // wait for any kind of message
+    if (driver_receive(ANY, &msg, &ipc_status)) {
+      printf("Driver_receive failed\n");
       continue;
     }
-    if (is_ipc_notify(ipc_status)) { 
-      switch (_ENDPOINT_P(msg.m_source)) {
-        case HARDWARE:
-          if (msg.m_notify.interrupts & irq_set) { 
-            kbc_ih();
-            if (!kbc_get_error()) {
-              if (kbc_ready()) {
-                kbc_get_scancode(scan, &scan_size);
-                if (scan[scan_size - 1] == ESC_BREAK_CODE) {
-                  esc_pressed = true;
-                }
 
-                CHECKCall(kbd_print_scancode(!(scan[scan_size - 1] & BREAK_CODE_BIT), scan_size, scan));
-              }
-            }
-          }
-          break;
-        default:
-          break;
+    // if there is a message from an i/o
+    if (is_ipc_notify(ipc_status) && _ENDPOINT_P(msg.m_source) == HARDWARE)
+      if (msg.m_notify.interrupts & BIT(bit_no)) {
+
+        kbc_ih(); // chamar o nosso handler
+
+        if (!another_read) {
+          codes[0] = scancode; // le byte
+
+          // deteta se o byte lido é MSB de um scancode de 2B
+          if (scancode == MSB_2B_SCANCODE)
+            another_read = true; // Marca para na proxima iteracao ler outro byte (lsb)
+          else
+            kbd_print_scancode(!(scancode & BIT(7)), 1, codes); // funcão do stor
+        }
+        else {
+          // ha um segundo byte a ler
+          codes[1] = scancode;  // guarda segundo byte
+          another_read = false; // desativa flag de segunda leitura
+          kbd_print_scancode(!(BIT(7) & scancode), 2, codes);
+        }
       }
-    }
-    else {
-    }
   }
 
-  CHECKCall(unsubscribe_interrupt(&kbc_hook_id));
-  CHECKCall(kbd_print_no_sysinb(inb_counter));
-
-  return EXIT_SUCCESS;
+  kbd_unsubscribe_int();          // devolve controlo do kbd ao minix
+  kbd_print_no_sysinb(count_inb); // só para mostrar nº chamadas
+  return 0;
 }
 
 int(kbd_test_poll)() {
 
-  uint8_t code[2] = { 0, 0 };
-  uint8_t size = 0;
+  // use polling instead of interrupts
+  uint8_t codes[2], size;
 
-  while (code[0] != ESC_BREAK_CODE)
-  {
-    CHECKCall(kbd_poll(code, &size)); // DO I WANNA RETURN AFTER AN ERROR ???
-    CHECKCall(kbd_print_scancode(!(code[size -1] & BREAK_CODE_BIT), size, code));
+  // faz polling até aparecer breakcode ESC
+  while (codes[0] != ESC_BREAKCODE) {
+
+    kbd_poll(codes, &size);
+
+    // print the code read
+    kbd_print_scancode(!(codes[size - 1] & BIT(7)), size, codes);
   }
-  
-  CHECKCall(kbd_restore());
 
-  CHECKCall(kbd_print_no_sysinb(inb_counter));
-
-  return EXIT_SUCCESS;
+  kbd_restore();                  // devolve controlo ao minix
+  kbd_print_no_sysinb(count_inb); // print de chamadas inb
+  return 0;
 }
 
-int (subscribe_interrupt)(uint8_t bit_no, int *hook_id, int irq_line) { // TODO: THIS SHOULD BE IN TIMER.H
-  NullSafety(&bit_no);
-  NullSafety(hook_id);
-  *hook_id = bit_no;
-  CHECKCall(sys_irqsetpolicy(irq_line, IRQ_REENABLE, hook_id));
-  return EXIT_SUCCESS;
-}
+extern unsigned counter; // Timer counter
 
 int(kbd_test_timed_scan)(uint8_t n) {
-  uint8_t kbc_bit_no = 1,timer_bit_no = 2;
-  int kbc_hook_id = 0,  ipc_status, timer_hook_id = 0;
-  bool esc_pressed = false, r;
-  uint16_t irq_set = BIT(kbc_bit_no);
-  uint16_t irq_timer_set = BIT(timer_bit_no);
 
-  CHECKCall(subscribe_interrupt(timer_bit_no ,&timer_hook_id, TIMER0_IRQ)); 
-  CHECKCall(subscribe_kbc_interrupt(kbc_bit_no, &kbc_hook_id, KEYBOARD_IRQ));
+  // Basicamente copiar o codigo da primeira funcao
+  // e adicionar tambem o subscribe e handler do timer
 
+  int ipc_status;
   message msg;
+  uint8_t bit_no_kbd, bit_no_timer;
 
-  unsigned char scan[2];
-  int scan_size;
+  // Substituir minix pelo nosso interrupt handler
+  kbd_subscribe_int(&bit_no_kbd);
 
-  while (n_interrupts < n * TIMER_ASEC_FREQ && !esc_pressed) { 
+  // Subscrever timer interrutps
+  timer_subscribe_int(&bit_no_timer);
 
-    if ((r = driver_receive(ANY, &msg, &ipc_status)) != 0) {
-      printf("driver_receive failed with: %d", r);
+  // vars para ler os bytes scancode
+  bool another_read = false;
+  uint8_t bytes[2];
+
+  while ((scancode != ESC_BREAKCODE)) {
+
+    if (driver_receive(ANY, &msg, &ipc_status) != 0) {
+      printf("driver_receive failed\n");
       continue;
     }
-    if (is_ipc_notify(ipc_status)) { 
-      switch (_ENDPOINT_P(msg.m_source)) {
-        case HARDWARE:
-          if (msg.m_notify.interrupts & irq_set) { 
-            n_interrupts = 0;
-            kbc_ih();
-            if (!kbc_get_error()) {
-              if (kbc_ready()) {
-                kbc_get_scancode(scan, &scan_size);
-                if (scan[scan_size - 1] == ESC_BREAK_CODE) {
-                  esc_pressed = true;
-                }
 
-                CHECKCall(kbd_print_scancode(!(scan[scan_size - 1] & BREAK_CODE_BIT), scan_size, scan));
-              }
-            }
-          }
+    if (is_ipc_notify(ipc_status))
+      if (_ENDPOINT_P(msg.m_source) == HARDWARE) {
 
-          if (msg.m_notify.interrupts & irq_timer_set) {
-            timer_int_handler();
+        // handle kbd interrupt
+        if (msg.m_notify.interrupts & BIT(KBD_IRQ)) {
+
+          // reset the afk timer counter
+          counter = 0;
+
+          kbc_ih(); // chamar o nosso handler
+
+          if (!another_read) {
+
+            bytes[0] = scancode; // le byte
+
+            if (scancode == MSB_2B_SCANCODE) // deteta se o byte lido é MSB de um scancode de 2B
+              another_read = true;           // Marca para na proxima iteracao ler outro byte (lsb)
+            else
+              kbd_print_scancode(!(BIT(7) & scancode), 1, bytes); // funcão do stor
           }
-          break;
-        default:
-          break;
+          else {
+            // ha um segundo byte a ler
+            bytes[1] = scancode;  // guarda segundo byte
+            another_read = false; // desativa flag de segunda leitura
+            kbd_print_scancode(!(BIT(7) & scancode), 2, bytes);
+          }
+        }
+
+        // handle timer interrupt
+        if (msg.m_notify.interrupts & BIT(TIMER0_IRQ)) {
+
+          timer_int_handler(); // chamar o nosso handler
+
+          if (counter == n * 60)
+            break;
+        }
       }
-    }
-    else {
-    }
   }
 
-  CHECKCall(unsubscribe_interrupt(&timer_hook_id));
-  CHECKCall(unsubscribe_interrupt(&kbc_hook_id));
-  CHECKCall(kbd_print_no_sysinb(inb_counter));
-
-  return EXIT_SUCCESS;
+  kbd_unsubscribe_int();          // devolve controlo do kbd ao minix
+  kbd_print_no_sysinb(count_inb); // só para mostrar nº chamadas
+  return 0;
 }
